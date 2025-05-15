@@ -1,8 +1,110 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_speed_dial/flutter_speed_dial.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await DatabaseHelper.instance.database; // Inicializa o banco de dados
   runApp(MyApp());
+}
+
+class DatabaseHelper {
+  static final DatabaseHelper instance = DatabaseHelper._init();
+  static Database? _database;
+
+  DatabaseHelper._init();
+
+  Future<Database> get database async {
+    if (_database != null) return _database!;
+    _database = await _initDB('notes.db');
+    return _database!;
+  }
+
+  Future<Database> _initDB(String filePath) async {
+    final dbPath = await getDatabasesPath();
+    final path = join(dbPath, filePath);
+
+    return await openDatabase(path, version: 1, onCreate: _createDB);
+  }
+
+  Future _createDB(Database db, int version) async {
+    await db.execute('''
+      CREATE TABLE notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        note_id INTEGER,
+        title TEXT,
+        completed INTEGER,
+        FOREIGN KEY (note_id) REFERENCES notes (id) ON DELETE CASCADE
+      )
+    ''');
+  }
+
+  Future<int> createNote(String title) async {
+    final db = await instance.database;
+    return await db.insert('notes', {'title': title});
+  }
+
+  Future<List<Map<String, dynamic>>> getNotes() async {
+    final db = await instance.database;
+    return await db.query('notes');
+  }
+
+  Future<int> updateNoteTitle(int id, String title) async {
+    final db = await instance.database;
+    return await db.update(
+      'notes',
+      {'title': title},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  Future<int> deleteNote(int id) async {
+    final db = await instance.database;
+    return await db.delete('notes', where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future<int> createTask(int noteId, String title, bool completed) async {
+    final db = await instance.database;
+    return await db.insert('tasks', {
+      'note_id': noteId,
+      'title': title,
+      'completed': completed ? 1 : 0,
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> getTasksForNote(int noteId) async {
+    final db = await instance.database;
+    return await db.query('tasks', where: 'note_id = ?', whereArgs: [noteId]);
+  }
+
+  Future<int> updateTask(int id, String title, bool completed) async {
+    final db = await instance.database;
+    return await db.update(
+      'tasks',
+      {'title': title, 'completed': completed ? 1 : 0},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  Future<int> deleteTask(int id) async {
+    final db = await instance.database;
+    return await db.delete('tasks', where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future close() async {
+    final db = await instance.database;
+    db.close();
+  }
 }
 
 class MyApp extends StatelessWidget {
@@ -23,9 +125,35 @@ class NotesScreen extends StatefulWidget {
 
 class _NotesScreenState extends State<NotesScreen> {
   List<Map<String, dynamic>> notes = [];
-
   Set<int> selectedNotes = {};
   bool isSelectionMode = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadNotes();
+  }
+
+  Future<void> _loadNotes() async {
+    final notesList = await DatabaseHelper.instance.getNotes();
+
+    List<Map<String, dynamic>> loadedNotes = [];
+
+    for (var note in notesList) {
+      final tasks = await DatabaseHelper.instance.getTasksForNote(note['id']);
+      loadedNotes.add({
+        'id': note['id'],
+        'title': note['title'],
+        'tasks': tasks.map((t) => t['title'] as String).toList(),
+        'completed': tasks.map((t) => t['completed'] == 1).toList(),
+        'task_ids': tasks.map((t) => t['id'] as int).toList(),
+      });
+    }
+
+    setState(() {
+      notes = loadedNotes;
+    });
+  }
 
   void toggleSelectionMode() {
     setState(() {
@@ -44,38 +172,31 @@ class _NotesScreenState extends State<NotesScreen> {
     });
   }
 
-  void deleteSelectedNotes() {
+  Future<void> deleteSelectedNotes() async {
+    for (var index in selectedNotes.toList()) {
+      await DatabaseHelper.instance.deleteNote(notes[index]['id']);
+    }
+
+    await _loadNotes();
+
     setState(() {
-      notes =
-          notes
-              .asMap()
-              .entries
-              .where((entry) => !selectedNotes.contains(entry.key))
-              .map((entry) => entry.value)
-              .toList();
       selectedNotes.clear();
       isSelectionMode = false;
     });
   }
 
-  void addNote() {
-    setState(() {
-      notes.add({'title': '', 'tasks': [], 'completed': []});
-    });
+  Future<void> addNote() async {
+    final id = await DatabaseHelper.instance.createNote('Nova Nota');
+    await _loadNotes();
   }
 
-  void openNote(int index) {
+  void openNote(context, int index) {
     showDialog(
       context: context,
       builder: (context) {
-        return NoteDialog(
-          note: notes[index],
-          onTaskUpdated: () {
-            setState(() {});
-          },
-        );
+        return NoteDialog(note: notes[index], onTaskUpdated: _loadNotes);
       },
-    );
+    ).then((_) => _loadNotes());
   }
 
   @override
@@ -86,7 +207,7 @@ class _NotesScreenState extends State<NotesScreen> {
         padding: const EdgeInsets.all(16.0),
         child: GridView.builder(
           itemCount: notes.length,
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
             crossAxisCount: 2,
             crossAxisSpacing: 10,
             mainAxisSpacing: 10,
@@ -98,7 +219,7 @@ class _NotesScreenState extends State<NotesScreen> {
                 if (isSelectionMode) {
                   toggleNoteSelection(index);
                 } else {
-                  openNote(index);
+                  openNote(context,index);
                 }
               },
               onLongPress: () {
@@ -114,11 +235,11 @@ class _NotesScreenState extends State<NotesScreen> {
                     width: 2,
                   ),
                 ),
-                padding: EdgeInsets.all(16),
+                padding: const EdgeInsets.all(16),
                 child: Center(
                   child: Text(
                     notes[index]['title'],
-                    style: TextStyle(fontSize: 16),
+                    style: const TextStyle(fontSize: 16),
                   ),
                 ),
               ),
@@ -132,28 +253,28 @@ class _NotesScreenState extends State<NotesScreen> {
         children: [
           if (isSelectionMode)
             SpeedDialChild(
-              child: Icon(Icons.close, color: Colors.white),
+              child: const Icon(Icons.close, color: Colors.white),
               backgroundColor: Colors.red,
               label: 'Sair do modo seleção',
               onTap: toggleSelectionMode,
             ),
           if (isSelectionMode)
             SpeedDialChild(
-              child: Icon(Icons.delete, color: Colors.white),
+              child: const Icon(Icons.delete, color: Colors.white),
               backgroundColor: Colors.red,
               label: 'Excluir Selecionadas',
               onTap: deleteSelectedNotes,
             ),
           if (!isSelectionMode)
             SpeedDialChild(
-              child: Icon(Icons.add, color: Colors.white),
+              child: const Icon(Icons.add, color: Colors.white),
               backgroundColor: Colors.green,
               label: 'Nova Nota',
               onTap: addNote,
             ),
           if (!isSelectionMode)
             SpeedDialChild(
-              child: Icon(Icons.check_box, color: Colors.white),
+              child: const Icon(Icons.check_box, color: Colors.white),
               backgroundColor: Colors.orange,
               label: 'Selecionar Notas',
               onTap: toggleSelectionMode,
@@ -196,39 +317,76 @@ class _NoteDialogState extends State<NoteDialog> {
     );
   }
 
-  void addTask() {
+  Future<void> addTask() async {
     if (taskController.text.isNotEmpty) {
+      await DatabaseHelper.instance.createTask(
+        widget.note['id'],
+        taskController.text,
+        false,
+      );
+
+      widget.onTaskUpdated();
+
       setState(() {
         widget.note['tasks'].add(taskController.text);
         widget.note['completed'].add(false);
+        widget.note['task_ids'].add(widget.note['tasks'].length - 1);
         taskTitleControllers.add(
           TextEditingController(text: taskController.text),
         );
         taskController.clear();
       });
-      widget.onTaskUpdated();
     }
   }
 
-  void toggleTask(int index) {
+  Future<void> toggleTask(int index) async {
+    final newCompleted = !widget.note['completed'][index];
+    await DatabaseHelper.instance.updateTask(
+      widget.note['task_ids'][index],
+      widget.note['tasks'][index],
+      newCompleted,
+    );
+
     setState(() {
-      widget.note['completed'][index] = !widget.note['completed'][index];
+      widget.note['completed'][index] = newCompleted;
     });
     widget.onTaskUpdated();
   }
 
-  void deleteTask(int index) {
+  Future<void> deleteTask(int index) async {
+    await DatabaseHelper.instance.deleteTask(widget.note['task_ids'][index]);
+
     setState(() {
       widget.note['tasks'].removeAt(index);
       widget.note['completed'].removeAt(index);
+      widget.note['task_ids'].removeAt(index);
       taskTitleControllers.removeAt(index);
     });
     widget.onTaskUpdated();
   }
 
-  void updateTaskTitle(int index, String newTitle) {
+  Future<void> updateTaskTitle(int index, String newTitle) async {
+    await DatabaseHelper.instance.updateTask(
+      widget.note['task_ids'][index],
+      newTitle,
+      widget.note['completed'][index],
+    );
+
     setState(() {
       widget.note['tasks'][index] = newTitle;
+    });
+    widget.onTaskUpdated();
+  }
+
+  Future<void> updateNoteTitle() async {
+    await DatabaseHelper.instance.updateNoteTitle(
+      widget.note['id'],
+      noteTitleController.text,
+    );
+
+    setState(() {
+      widget.note['title'] = noteTitleController.text;
+      isEditingNoteTitle = false;
     });
     widget.onTaskUpdated();
   }
@@ -246,7 +404,7 @@ class _NoteDialogState extends State<NoteDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      titlePadding: EdgeInsets.only(left: 8, right: 8, top: 8),
+      titlePadding: const EdgeInsets.only(left: 8, right: 8, top: 8),
       title: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
@@ -255,24 +413,18 @@ class _NoteDialogState extends State<NoteDialog> {
                 child: TextField(
                   controller: noteTitleController,
                   autofocus: true,
-                  onSubmitted: (_) {
-                    setState(() {
-                      widget.note['title'] = noteTitleController.text;
-                      isEditingNoteTitle = false;
-                      widget.onTaskUpdated();
-                    });
-                  },
+                  onSubmitted: (_) => updateNoteTitle(),
                 ),
               )
               : Expanded(
                 child: Text(
                   widget.note['title'],
                   textAlign: TextAlign.center,
-                  style: TextStyle(fontWeight: FontWeight.bold),
+                  style: const TextStyle(fontWeight: FontWeight.bold),
                 ),
               ),
           IconButton(
-            icon: Icon(Icons.edit, color: Colors.blue),
+            icon: const Icon(Icons.edit, color: Colors.blue),
             onPressed: () {
               setState(() {
                 isEditingNoteTitle = true;
@@ -280,7 +432,7 @@ class _NoteDialogState extends State<NoteDialog> {
             },
           ),
           IconButton(
-            icon: Icon(Icons.close, color: Colors.red),
+            icon: const Icon(Icons.close, color: Colors.red),
             onPressed: () => Navigator.of(context).pop(),
           ),
         ],
@@ -295,18 +447,18 @@ class _NoteDialogState extends State<NoteDialog> {
                 Expanded(
                   child: TextField(
                     controller: taskController,
-                    decoration: InputDecoration(
+                    decoration: const InputDecoration(
                       hintText: 'Digite o título da nova tarefa',
                     ),
                   ),
                 ),
                 IconButton(
-                  icon: Icon(Icons.add, color: Colors.green),
+                  icon: const Icon(Icons.add, color: Colors.green),
                   onPressed: addTask,
                 ),
               ],
             ),
-            SizedBox(height: 10),
+            const SizedBox(height: 10),
             Expanded(
               child: ListView.builder(
                 itemCount: widget.note['tasks'].length,
@@ -334,7 +486,7 @@ class _NoteDialogState extends State<NoteDialog> {
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         IconButton(
-                          icon: Icon(Icons.delete, color: Colors.red),
+                          icon: const Icon(Icons.delete, color: Colors.red),
                           onPressed: () => deleteTask(index),
                         ),
                       ],
