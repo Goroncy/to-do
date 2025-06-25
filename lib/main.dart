@@ -2,11 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_speed_dial/flutter_speed_dial.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await DatabaseHelper.instance.database; // Inicializa o banco de dados
-  runApp(MyApp());
+  await DatabaseHelper.instance.database;
+  runApp(const MyApp());
 }
 
 class DatabaseHelper {
@@ -17,7 +20,7 @@ class DatabaseHelper {
 
   Future<Database> get database async {
     if (_database != null) return _database!;
-    _database = await _initDB('notes.db');
+    _database = await _initDB('todo.db');
     return _database!;
   }
 
@@ -25,14 +28,15 @@ class DatabaseHelper {
     final dbPath = await getDatabasesPath();
     final path = join(dbPath, filePath);
 
-    return await openDatabase(path, version: 1, onCreate: _createDB);
+    return await openDatabase(path, version: 2, onCreate: _createDB);
   }
 
   Future _createDB(Database db, int version) async {
     await db.execute('''
       CREATE TABLE notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT
+        title TEXT,
+        location TEXT
       )
     ''');
 
@@ -47,9 +51,12 @@ class DatabaseHelper {
     ''');
   }
 
-  Future<int> createNote(String title) async {
+  Future<int> createNote(String title, {String? location}) async {
     final db = await instance.database;
-    return await db.insert('notes', {'title': title});
+    return await db.insert('notes', {
+      'title': title,
+      'location': location,
+    });
   }
 
   Future<List<Map<String, dynamic>>> getNotes() async {
@@ -107,12 +114,71 @@ class DatabaseHelper {
   }
 }
 
+class LocationService {
+  static Future<Position> _getCurrentLocation() async {
+    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      throw Exception('Serviço de localização desabilitado');
+    }
+
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        throw Exception('Permissão de localização negada');
+      }
+    }
+
+    if (permission == LocationPermission.deniedForever) {
+      throw Exception('Permissão de localização permanentemente negada');
+    }
+
+    return await Geolocator.getCurrentPosition(
+      desiredAccuracy: LocationAccuracy.high,
+    );
+  }
+
+  static Future<String?> getAddressFromCoordinates(Position position) async {
+    try {
+      final response = await http.get(Uri.parse(
+        'https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${position.latitude}&lon=${position.longitude}',
+      ));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return data['display_name'] as String?;
+      }
+      return null;
+    } catch (e) {
+      print('Erro ao obter endereço: $e');
+      return null;
+    }
+  }
+
+  static Future<String?> getCurrentAddress() async {
+    try {
+      final position = await _getCurrentLocation();
+      return await getAddressFromCoordinates(position);
+    } catch (e) {
+      print('Erro ao obter localização: $e');
+      return null;
+    }
+  }
+}
+
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(debugShowCheckedModeBanner: false, home: NotesScreen());
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: const NotesScreen(),
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        visualDensity: VisualDensity.adaptivePlatformDensity,
+      ),
+    );
   }
 }
 
@@ -127,6 +193,8 @@ class _NotesScreenState extends State<NotesScreen> {
   List<Map<String, dynamic>> notes = [];
   Set<int> selectedNotes = {};
   bool isSelectionMode = false;
+  final GlobalKey<ScaffoldMessengerState> scaffoldMessengerKey =
+      GlobalKey<ScaffoldMessengerState>();
 
   @override
   void initState() {
@@ -144,6 +212,7 @@ class _NotesScreenState extends State<NotesScreen> {
       loadedNotes.add({
         'id': note['id'],
         'title': note['title'],
+        'location': note['location'],
         'tasks': tasks.map((t) => t['title'] as String).toList(),
         'completed': tasks.map((t) => t['completed'] == 1).toList(),
         'task_ids': tasks.map((t) => t['id'] as int).toList(),
@@ -186,11 +255,26 @@ class _NotesScreenState extends State<NotesScreen> {
   }
 
   Future<void> addNote() async {
-    final id = await DatabaseHelper.instance.createNote('Nova Nota');
-    await _loadNotes();
+    try {
+      final address = await LocationService.getCurrentAddress();
+      
+      await DatabaseHelper.instance.createNote(
+        'Nova Nota',
+        location: address ?? 'Localização desconhecida',
+      );
+      
+      await _loadNotes();
+    } catch (e) {
+      await DatabaseHelper.instance.createNote('Nova Nota');
+      await _loadNotes();
+      
+      scaffoldMessengerKey.currentState?.showSnackBar(
+        SnackBar(content: Text('Erro ao obter localização: ${e.toString()}')),
+      );
+    }
   }
 
-  void openNote(context, int index) {
+  void openNote(BuildContext context, int index) {
     showDialog(
       context: context,
       builder: (context) {
@@ -202,7 +286,19 @@ class _NotesScreenState extends State<NotesScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      key: scaffoldMessengerKey,
       backgroundColor: Colors.grey[200],
+      appBar: AppBar(
+        title: const Text('Notas com Localização'),
+        centerTitle: true,
+        actions: [
+          if (isSelectionMode)
+            IconButton(
+              icon: const Icon(Icons.delete),
+              onPressed: deleteSelectedNotes,
+            ),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
         child: GridView.builder(
@@ -219,7 +315,7 @@ class _NotesScreenState extends State<NotesScreen> {
                 if (isSelectionMode) {
                   toggleNoteSelection(index);
                 } else {
-                  openNote(context,index);
+                  openNote(context, index);
                 }
               },
               onLongPress: () {
@@ -234,13 +330,55 @@ class _NotesScreenState extends State<NotesScreen> {
                     color: isSelected ? Colors.blue : Colors.transparent,
                     width: 2,
                   ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.grey.withOpacity(0.3),
+                      spreadRadius: 1,
+                      blurRadius: 3,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
                 ),
                 padding: const EdgeInsets.all(16),
-                child: Center(
-                  child: Text(
-                    notes[index]['title'],
-                    style: const TextStyle(fontSize: 16),
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      notes[index]['title'],
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    if (notes[index]['location'] != null) ...[
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          const Icon(Icons.location_on, size: 12, color: Colors.grey),
+                          const SizedBox(width: 4),
+                          Expanded(
+                            child: Text(
+                              notes[index]['location'],
+                              style: const TextStyle(
+                                fontSize: 10,
+                                color: Colors.grey,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                    const Spacer(),
+                    if (notes[index]['tasks'].isNotEmpty)
+                      Text(
+                        '${notes[index]['tasks'].length} tarefa(s)',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.blue,
+                        ),
+                      ),
+                  ],
                 ),
               ),
             );
@@ -410,19 +548,19 @@ class _NoteDialogState extends State<NoteDialog> {
         children: [
           isEditingNoteTitle
               ? Expanded(
-                child: TextField(
-                  controller: noteTitleController,
-                  autofocus: true,
-                  onSubmitted: (_) => updateNoteTitle(),
-                ),
-              )
+                  child: TextField(
+                    controller: noteTitleController,
+                    autofocus: true,
+                    onSubmitted: (_) => updateNoteTitle(),
+                  ),
+                )
               : Expanded(
-                child: Text(
-                  widget.note['title'],
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(fontWeight: FontWeight.bold),
+                  child: Text(
+                    widget.note['title'],
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
                 ),
-              ),
           IconButton(
             icon: const Icon(Icons.edit, color: Colors.blue),
             onPressed: () {
@@ -442,6 +580,26 @@ class _NoteDialogState extends State<NoteDialog> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (widget.note['location'] != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Row(
+                  children: [
+                    const Icon(Icons.location_on, size: 16, color: Colors.grey),
+                    const SizedBox(width: 5),
+                    Expanded(
+                      child: Text(
+                        widget.note['location'],
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.grey,
+                          fontStyle: FontStyle.italic,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             Row(
               children: [
                 Expanded(
@@ -468,20 +626,19 @@ class _NoteDialogState extends State<NoteDialog> {
                       value: widget.note['completed'][index],
                       onChanged: (_) => toggleTask(index),
                     ),
-                    title:
-                        editingTaskIndices.contains(index)
-                            ? TextField(
-                              controller: taskTitleControllers[index],
-                              autofocus: true,
-                              onSubmitted: (newText) {
-                                updateTaskTitle(index, newText);
-                                toggleEditTask(index);
-                              },
-                            )
-                            : GestureDetector(
-                              onTap: () => toggleEditTask(index),
-                              child: Text(widget.note['tasks'][index]),
-                            ),
+                    title: editingTaskIndices.contains(index)
+                        ? TextField(
+                            controller: taskTitleControllers[index],
+                            autofocus: true,
+                            onSubmitted: (newText) {
+                              updateTaskTitle(index, newText);
+                              toggleEditTask(index);
+                            },
+                          )
+                        : GestureDetector(
+                            onTap: () => toggleEditTask(index),
+                            child: Text(widget.note['tasks'][index]),
+                          ),
                     trailing: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
